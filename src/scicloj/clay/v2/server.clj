@@ -205,32 +205,27 @@
 
 (defn handle-parameterized-request
   "Handle requests with URL parameters by re-evaluating notebook.
-   Generates HTML in memory using dynamic binding for thread safety."
+   Generates HTML in memory, passing URL params through spec (no thread bindings)."
   [uri query-params state]
   (try
     (let [source-path (html-uri->source-path uri)]
       (println "Parameterized request:" uri "params:" query-params)
 
-      ;; Dynamically resolve vars to avoid cyclic dependencies
-      (let [url-params-var (find-var 'scicloj.clay.v2.api/*url-params*)
-            make-fn (resolve 'scicloj.clay.v2.make/make!)]
+      ;; Dynamically resolve functions
+      (let [config-fn (resolve 'scicloj.clay.v2.config/config)
+            ->single-ns-spec-fn (resolve 'scicloj.clay.v2.make/->single-ns-spec)]
 
-        ;; Bind params and generate HTML in memory
-        (push-thread-bindings {url-params-var query-params})
-        (try
-          (let [spec {:source-path source-path
-                      :show false
-                      :live-reload false}
-                _ (make-fn spec)
-                ;; Read generated HTML from disk for now
-                ;; TODO: Make this truly in-memory
-                html-path (str (:base-target-path state) uri)
-                html (slurp html-path)]
-            {:body (wrap-html html state)
-             :headers {"Content-Type" "text/html"}
-             :status 200})
-          (finally
-            (pop-thread-bindings)))))
+        ;; Pass URL params through spec instead of thread bindings
+        (let [base-config (config-fn {:show false :live-reload false})
+              spec (->single-ns-spec-fn {:return-html? true
+                                         :url-params query-params}  ; Pass params in spec
+                                       base-config
+                                       source-path)
+              handle-single-fn (resolve 'scicloj.clay.v2.make/handle-single-source-spec!)
+              html (handle-single-fn spec)]
+          {:body (wrap-html html state)
+           :headers {"Content-Type" "text/html"}
+           :status 200})))
 
     (catch Exception e
       (println "Error in parameterized request:" (.getMessage e))

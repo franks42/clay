@@ -360,20 +360,27 @@
                                           full-target-path
                                           qmd-target-path
                                           book
-                                          post-process]}]
+                                          post-process
+                                          return-html?]}]
   (let [{:keys [items test-forms exception]} (notebook/items-and-test-forms notes spec)
         spec-with-items (assoc spec
                                :items items
                                :exception exception)]
     [(case (first format)
        :hiccup (page/hiccup spec-with-items)
-       :html (do (-> spec-with-items
-                     (config/add-field :page (if post-process
-                                               (comp post-process page/html)
-                                               page/html))
-                     server/update-page!)
-                 (println "Clay: " [:wrote full-target-path (time/now)])
-                 [:wrote full-target-path])
+       :html (let [html (-> spec-with-items
+                            ((if post-process
+                               (comp post-process page/html)
+                               page/html)))]
+               (if return-html?
+                 ;; In-memory mode: return HTML without writing to disk
+                 {:html html}
+                 ;; Normal mode: write to disk
+                 (do (-> spec-with-items
+                         (assoc :page html)
+                         server/update-page!)
+                     (println "Clay: " [:wrote full-target-path (time/now)])
+                     [:wrote full-target-path])))
        :gfm (let [gfm-target (str/replace full-target-path #"\.html$" ".md")]
               (->> spec-with-items
                    page/gfm
@@ -418,26 +425,32 @@
                                           qmd-target-path
                                           use-kindly-render
                                           keep-existing
-                                          external-requirements]}]
+                                          external-requirements
+                                          return-html?]}]
   (when (or (#{"clj" "cljc"} source-type)
             single-form
             single-value)
     (try
-      (files/init-target! full-target-path)
+      (when-not return-html?
+        (files/init-target! full-target-path))
       (let [skip (and external-requirements
                       keep-existing
                       qmd-target-path
-                      (fs/exists? qmd-target-path))
-            result (if skip
-                     (do (println "Clay:" [:kept qmd-target-path])
-                         [:kept qmd-target-path])
-                     ;; else execute the notebook and render it
-                     (let [notes (notebook/spec-notes spec)]
-                       (if use-kindly-render
+                      (fs/exists? qmd-target-path))]
+        (if skip
+          (do (println "Clay:" [:kept qmd-target-path])
+              [:kept qmd-target-path])
+          ;; else execute the notebook and render it
+          (let [notes (notebook/spec-notes spec)
+                result (if use-kindly-render
                          (kindly-render-notebook notes spec)
-                         (clay-render-notebook notes spec))))]
-        [result
-         (maybe-run-quarto! spec)])
+                         (clay-render-notebook notes spec))]
+            (if return-html?
+              ;; In-memory mode: extract and return just the HTML string
+              (-> result first (get :html))
+              ;; Normal mode: return result with quarto
+              [result
+               (maybe-run-quarto! spec)]))))
       (catch Throwable e
         (when-not (-> e ex-data :id (= ::notebook-exception))
           (-> spec
@@ -449,7 +462,8 @@
           (do (println "Clay FAILED:" full-source-path)
               (println e))
           (throw e)))
-      (finally (files/init-target! full-target-path)))))
+      (finally (when-not return-html?
+                 (files/init-target! full-target-path))))))
 
 (defn sync-resources! [{:keys [base-target-path
                                quarto-target-path

@@ -10,6 +10,9 @@
             [scicloj.kindly-advice.v1.api :as kindly-advice])
   (:import (java.io StringWriter)))
 
+;; Lock for parameterized request evaluation to prevent concurrent namespace manipulation
+(defonce ^:private parameterized-eval-lock (Object.))
+
 (set! *warn-on-reflection* true)
 
 (defn deref-if-needed [v]
@@ -434,18 +437,42 @@
      result#))
 
 (defn spec-notes [{:as spec
-                   :keys      [pprint-margin ns-form full-source-path]
+                   :keys      [pprint-margin ns-form full-source-path url-params]
                    :or        {pprint-margin pp/*print-right-margin*}}]
-  (binding [*ns* *ns*
-            *warn-on-reflection* *warn-on-reflection*
-            *unchecked-math* *unchecked-math*
-            pp/*print-right-margin* pprint-margin]
-    (-> (relevant-notes spec)
-        (complete-notes spec)
-        (with-out-err-captured)
-        (log-time (str "Evaluated "
-                       (or (some-> ns-form second name)
-                           (some-> full-source-path fs/file-name)))))))
+  ;; Dynamically resolve *url-params* to avoid cyclic dependency with api namespace
+  ;; URL params are now passed through spec instead of thread bindings - much simpler!
+  (let [url-params-var (find-var 'scicloj.clay.v2.api/*url-params*)
+        is-parameterized? (and url-params (seq url-params))
+
+        ;; Parameterized requests need locking to prevent concurrent namespace manipulation
+        eval-fn (fn []
+                  ;; For parameterized requests, remove the namespace first to force fresh evaluation
+                  ;; This ensures def forms are re-evaluated with new parameter values
+                  (when (and is-parameterized? ns-form)
+                    (when-let [ns-sym (second ns-form)]
+                      (when (find-ns ns-sym)
+                        (remove-ns ns-sym))))
+
+                  (let [binding-map (cond-> {#'*ns* *ns*
+                                             #'*warn-on-reflection* *warn-on-reflection*
+                                             #'*unchecked-math* *unchecked-math*
+                                             #'pp/*print-right-margin* pprint-margin}
+                                      ;; Bind *url-params* from spec if provided
+                                      (and url-params-var url-params)
+                                      (assoc url-params-var url-params))]
+                    (with-bindings binding-map
+                      (-> (relevant-notes spec)
+                          (complete-notes spec)
+                          (with-out-err-captured)
+                          (log-time (str "Evaluated "
+                                         (or (some-> ns-form second name)
+                                             (some-> full-source-path fs/file-name))))))))]
+
+    ;; Use lock for parameterized requests to serialize namespace manipulation
+    (if is-parameterized?
+      (locking parameterized-eval-lock
+        (eval-fn))
+      (eval-fn))))
 
 (defn items-and-test-forms
   [notes spec]
