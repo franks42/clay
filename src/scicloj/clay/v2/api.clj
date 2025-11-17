@@ -9,6 +9,12 @@
             [scicloj.clay.v2.live-reload :as live-reload]
             [scicloj.kindly.v4.kind :as kind]))
 
+(def ^:dynamic *url-params*
+  "URL query parameters available during parameterized evaluation.
+   Map of string keys to string values.
+   Example: {\"wallet\" \"pb1abc...\" \"minAUM\" \"500\"}"
+  {})
+
 (defn stop! []
   (server/close!)
   (live-reload/stop!)

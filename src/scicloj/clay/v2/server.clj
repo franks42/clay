@@ -6,6 +6,7 @@
             [hiccup.page]
             [org.httpkit.server :as httpkit]
             [ring.util.mime-type :as mime-type]
+            [ring.middleware.params :refer [wrap-params]]
             [scicloj.clay.v2.server.state :as server.state]
             [scicloj.clay.v2.util.time :as time]
             [clojure.string :as str]
@@ -193,9 +194,53 @@
       (throw (Exception. (str "Symbol not found: "
                               func))))))
 
+(defn html-uri->source-path
+  "Converts /index.html to notebooks/index.clj
+   Handles Clay's filename conversion: hyphens to underscores"
+  [uri]
+  (let [html-file (str/replace uri #"^/" "")
+        base-name (str/replace html-file #"\.html$" "")
+        base-name (str/replace base-name #"_" "-")]  ; Clay converts - to _
+    (str "notebooks/" base-name ".clj")))
+
+(defn handle-parameterized-request
+  "Handle requests with URL parameters by re-evaluating notebook.
+   Generates HTML in memory using dynamic binding for thread safety."
+  [uri query-params state]
+  (try
+    (let [source-path (html-uri->source-path uri)]
+      (println "Parameterized request:" uri "params:" query-params)
+
+      ;; Dynamically resolve vars to avoid cyclic dependencies
+      (let [url-params-var (find-var 'scicloj.clay.v2.api/*url-params*)
+            make-fn (resolve 'scicloj.clay.v2.make/make!)]
+
+        ;; Bind params and generate HTML in memory
+        (push-thread-bindings {url-params-var query-params})
+        (try
+          (let [spec {:source-path source-path
+                      :show false
+                      :live-reload false}
+                _ (make-fn spec)
+                ;; Read generated HTML from disk for now
+                ;; TODO: Make this truly in-memory
+                html-path (str (:base-target-path state) uri)
+                html (slurp html-path)]
+            {:body (wrap-html html state)
+             :headers {"Content-Type" "text/html"}
+             :status 200})
+          (finally
+            (pop-thread-bindings)))))
+
+    (catch Exception e
+      (println "Error in parameterized request:" (.getMessage e))
+      (.printStackTrace e)
+      {:body (str "Error generating parameterized page: " (.getMessage e))
+       :status 500})))
+
 (defn routes
   "Web server routes."
-  [{:keys [:body :request-method :uri]
+  [{:keys [:body :request-method :uri :query-params]
     :as req}]
   (let [state @server.state/*state]
     (if (:websocket? req)
@@ -205,7 +250,16 @@
                                             (httpkit/send! ch "loading")))
                                :on-close (fn [ch _reason] (swap! *clients disj ch))
                                :on-receive (fn [_ch msg])})
-      (case [request-method uri]
+
+      ;; NEW: Check for parameterized HTML requests FIRST
+      (if (and (seq query-params)
+               (= request-method :get)
+               (re-matches #".*\.html$" uri))
+        ;; Parameterized request - generate in memory
+        (handle-parameterized-request uri query-params state)
+
+        ;; EXISTING: All other routes (unchanged)
+        (case [request-method uri]
         [:get "/"] {:body (-> state
                               page
                               (wrap-base-url state)
@@ -242,12 +296,12 @@
               [:get "/Clay.svg.png"] {:body   (io/input-stream (io/resource "Clay.svg.png"))
                                       :status 200}
               {:body   "not found"
-               :status 404})))))))
+               :status 404}))))))))
 
 (defonce *stop-server! (atom nil))
 
 (defn core-http-server [port]
-  (httpkit/run-server #'routes {:port port}))
+  (httpkit/run-server (wrap-params #'routes) {:port port}))
 
 (defn port->url [port]
   (str "http://localhost:" port "/"))
