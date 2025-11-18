@@ -16,11 +16,174 @@
 
 (def default-port 1971)
 
+;; Forward declarations for functions used before definition
+(declare html-uri->source-path wrap-html)
+
 (defonce *clients (atom #{}))
 
 (defn broadcast! [msg]
   (doseq [ch @*clients]
     (httpkit/send! ch msg)))
+
+;; =============================================================================
+;; State Management for Parameterized Notebooks
+;; =============================================================================
+
+;; Stores parameter states for parameterized notebook requests.
+;; Maps UUID -> {:params {...} :expires <timestamp>}
+(defonce *states (atom {}))
+
+(def default-state-ttl-hours 24)
+
+(defn generate-state-id
+  "Generate a cryptographically secure random state ID."
+  []
+  (let [uuid (java.util.UUID/randomUUID)]
+    (str uuid)))
+
+(defn create-state!
+  "Create a new state with the given params and return the state-id."
+  ([params] (create-state! params default-state-ttl-hours))
+  ([params ttl-hours]
+   (let [id (generate-state-id)
+         expires (+ (System/currentTimeMillis)
+                    (* ttl-hours 3600000))]
+     (swap! *states assoc id {:params params :expires expires})
+     id)))
+
+(defn get-state
+  "Get state by ID. Returns nil if not found or expired."
+  [id]
+  (when-let [state (get @*states id)]
+    (if (< (System/currentTimeMillis) (:expires state))
+      state
+      (do
+        ;; Lazy cleanup of expired state
+        (swap! *states dissoc id)
+        nil))))
+
+(defn cleanup-expired-states!
+  "Remove all expired states from storage."
+  []
+  (let [now (System/currentTimeMillis)]
+    (swap! *states
+           (fn [states]
+             (->> states
+                  (filter (fn [[_ state]] (< now (:expires state))))
+                  (into {}))))))
+
+;; =============================================================================
+;; JavaScript for Link-to-POST Conversion
+;; =============================================================================
+
+(defn link-to-post-script
+  "JavaScript that converts same-origin links with query params to POST requests.
+   This keeps all parameters out of URLs for privacy."
+  []
+  "<script type=\"text/javascript\">
+// Clay: Convert same-origin links to POST for parameter privacy
+document.addEventListener('click', (e) => {
+  const link = e.target.closest('a');
+  if (link && link.href && link.href.includes('?')) {
+    try {
+      const url = new URL(link.href, window.location.href);
+      // Only convert same-origin links (Clay server)
+      if (url.origin === window.location.origin) {
+        e.preventDefault();
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = url.pathname;
+        form.style.display = 'none';
+        url.searchParams.forEach((value, key) => {
+          const input = document.createElement('input');
+          input.type = 'hidden';
+          input.name = key;
+          input.value = value;
+          form.appendChild(input);
+        });
+        document.body.appendChild(form);
+        form.submit();
+      }
+    } catch (err) {
+      // Invalid URL, let browser handle normally
+    }
+  }
+});
+</script>
+")
+
+;; =============================================================================
+;; URL Parsing for State-Based Routes
+;; =============================================================================
+
+(defn parse-state-url
+  "Parse URLs like /app/page.html/{state-id} into {:page 'page.html' :state-id 'uuid'}.
+   Returns nil if URL doesn't match the state pattern."
+  [uri]
+  (when-let [[_ page state-id] (re-matches #"/app/([^/]+\.html)/([^/]+)" uri)]
+    {:page page :state-id state-id}))
+
+;; =============================================================================
+;; Route Handlers for Stateful Parameterized Notebooks
+;; =============================================================================
+
+(defn handle-initial-post
+  "Handle POST /page.html - Create state from body params and redirect.
+   Flow: POST params → create state → 303 redirect to /app/page.html/{state-id}"
+  [uri body-params _server-state]
+  (let [page (str/replace uri #"^/" "")
+        state-id (create-state! body-params)]
+    (println "Initial POST:" page "params:" body-params "→ state-id:" state-id)
+    {:status 303
+     :headers {"Location" (str "/app/" page "/" state-id)}}))
+
+(defn handle-state-post
+  "Handle POST /app/page.html/{state-id} - Merge params and create new state.
+   Flow: lookup current → merge with new → create new state → 303 redirect"
+  [page current-state-id body-params _server-state]
+  (if-let [current (get-state current-state-id)]
+    (let [merged-params (merge (:params current) body-params)
+          new-state-id (create-state! merged-params)]
+      (println "State POST:" page "old-state:" current-state-id "→ new-state:" new-state-id)
+      {:status 303
+       :headers {"Location" (str "/app/" page "/" new-state-id)}})
+    ;; Current state expired/not found
+    {:status 404
+     :body "State not found or expired. Please submit params again."}))
+
+(defn handle-state-get
+  "Handle GET /app/page.html/{state-id} - Render notebook with stored params.
+   Flow: lookup state → evaluate notebook → inject link-to-POST script → return HTML"
+  [page state-id server-state]
+  (if-let [stored-state (get-state state-id)]
+    (let [params (:params stored-state)
+          uri (str "/" page)]
+      (println "State GET:" page "state-id:" state-id "params:" params)
+      (try
+        (let [source-path (html-uri->source-path uri)
+              config-fn (resolve 'scicloj.clay.v2.config/config)
+              ->single-ns-spec-fn (resolve 'scicloj.clay.v2.make/->single-ns-spec)
+              base-config (config-fn {:show false :live-reload false})
+              spec (->single-ns-spec-fn {:return-html? true
+                                          :url-params params}
+                                        base-config
+                                        source-path)
+              handle-single-fn (resolve 'scicloj.clay.v2.make/handle-single-source-spec!)
+              html (handle-single-fn spec)
+              ;; Inject link-to-POST script for privacy
+              html-with-script (str/replace html #"(<head[^>]*>)"
+                                            (str "$1\n" (link-to-post-script)))]
+          {:body (wrap-html html-with-script server-state)
+           :headers {"Content-Type" "text/html"}
+           :status 200})
+        (catch Exception e
+          (println "Error rendering state:" state-id (.getMessage e))
+          (.printStackTrace e)
+          {:body (str "Error generating page: " (.getMessage e))
+           :status 500})))
+    ;; State not found or expired
+    {:status 404
+     :body "State not found or expired. Please submit params again."}))
 
 (defn scittle-eval-string!
   "Send ClojureScript code to be evaluated on the Clay page.
@@ -203,41 +366,18 @@
         base-name (str/replace base-name #"_" "-")]  ; Clay converts - to _
     (str "notebooks/" base-name ".clj")))
 
-(defn handle-parameterized-request
-  "Handle requests with URL parameters by re-evaluating notebook.
-   Generates HTML in memory, passing URL params through spec (no thread bindings)."
-  [uri query-params state]
-  (try
-    (let [source-path (html-uri->source-path uri)]
-      (println "Parameterized request:" uri "params:" query-params)
+;; Legacy param-preservation-script removed - replaced by stateful POST-based approach
 
-      ;; Dynamically resolve functions
-      (let [config-fn (resolve 'scicloj.clay.v2.config/config)
-            ->single-ns-spec-fn (resolve 'scicloj.clay.v2.make/->single-ns-spec)]
-
-        ;; Pass URL params through spec instead of thread bindings
-        (let [base-config (config-fn {:show false :live-reload false})
-              spec (->single-ns-spec-fn {:return-html? true
-                                         :url-params query-params}  ; Pass params in spec
-                                       base-config
-                                       source-path)
-              handle-single-fn (resolve 'scicloj.clay.v2.make/handle-single-source-spec!)
-              html (handle-single-fn spec)]
-          {:body (wrap-html html state)
-           :headers {"Content-Type" "text/html"}
-           :status 200})))
-
-    (catch Exception e
-      (println "Error in parameterized request:" (.getMessage e))
-      (.printStackTrace e)
-      {:body (str "Error generating parameterized page: " (.getMessage e))
-       :status 500})))
+;; Legacy handle-parameterized-request removed - replaced by handle-initial-post,
+;; handle-state-post, and handle-state-get for privacy-preserving stateful approach
 
 (defn routes
   "Web server routes."
-  [{:keys [:body :request-method :uri :query-params]
+  [{:keys [:body :request-method :uri :query-params :form-params]
     :as req}]
-  (let [state @server.state/*state]
+  (let [state @server.state/*state
+        ;; Merge form-params (POST body) and query-params
+        body-params (or form-params {})]
     (if (:websocket? req)
       (httpkit/as-channel req {:on-open (fn [ch]
                                           (swap! *clients conj ch)
@@ -246,52 +386,58 @@
                                :on-close (fn [ch _reason] (swap! *clients disj ch))
                                :on-receive (fn [_ch msg])})
 
-      ;; NEW: Check for parameterized HTML requests FIRST
-      (if (and (seq query-params)
-               (= request-method :get)
-               (re-matches #".*\.html$" uri))
-        ;; Parameterized request - generate in memory
-        (handle-parameterized-request uri query-params state)
+      ;; Check for state-based routes first (/app/page.html/{state-id})
+      (if-let [{:keys [page state-id]} (parse-state-url uri)]
+        (case request-method
+          :get (handle-state-get page state-id state)
+          :post (handle-state-post page state-id body-params state)
+          {:status 405 :body "Method not allowed"})
 
-        ;; EXISTING: All other routes (unchanged)
-        (case [request-method uri]
-        [:get "/"] {:body (-> state
-                              page
-                              (wrap-base-url state)
-                              (wrap-html state))
-                    :headers {"Content-Type" "text/html"}
-                    :status 200}
-        [:get "/counter"] {:body (-> state
-                                     :counter
-                                     str)
-                           :status 200}
-        [:post "/kindly-compute"] (let [input (-> body
-                                                  (transit/reader :json)
-                                                  transit/read
-                                                  read-string)
-                                        output (compute input)]
-                                    {:body (pr-str output)
-                                     :status 200})
-        ;; else
-        (let [f (io/file (str (:base-target-path state) uri))]
-          (if (.exists f)
-            {:body    (if (re-matches #".*\.html$" uri)
-                        (-> f
-                            slurp
-                            (wrap-html state))
-                        f)
-             :headers (when-let [t (mime-type/ext-mime-type uri)]
-                        {"Content-Type" t})
-             :status  200}
-            (case [request-method uri]
-              ;; user files have priority, otherwise serve the default from resources
-              [:get "/favicon.ico"] {:body   (io/input-stream (io/resource "favicon.ico"))
-                                     :status 200}
-              ;; this image is for the header above the page during interactive mode
-              [:get "/Clay.svg.png"] {:body   (io/input-stream (io/resource "Clay.svg.png"))
-                                      :status 200}
-              {:body   "not found"
-               :status 404}))))))))
+        ;; Check for initial POST to create state (POST /page.html)
+        (if (and (= request-method :post)
+                 (re-matches #"/[^/]+\.html$" uri)
+                 (seq body-params))
+          (handle-initial-post uri body-params state)
+
+          ;; EXISTING: All other routes (unchanged)
+          (case [request-method uri]
+            [:get "/"] {:body (-> state
+                                  page
+                                  (wrap-base-url state)
+                                  (wrap-html state))
+                        :headers {"Content-Type" "text/html"}
+                        :status 200}
+            [:get "/counter"] {:body (-> state
+                                         :counter
+                                         str)
+                               :status 200}
+            [:post "/kindly-compute"] (let [input (-> body
+                                                      (transit/reader :json)
+                                                      transit/read
+                                                      read-string)
+                                            output (compute input)]
+                                        {:body (pr-str output)
+                                         :status 200})
+            ;; else
+            (let [f (io/file (str (:base-target-path state) uri))]
+              (if (.exists f)
+                {:body    (if (re-matches #".*\.html$" uri)
+                            (-> f
+                                slurp
+                                (wrap-html state))
+                            f)
+                 :headers (when-let [t (mime-type/ext-mime-type uri)]
+                            {"Content-Type" t})
+                 :status  200}
+                (case [request-method uri]
+                  ;; user files have priority, otherwise serve the default from resources
+                  [:get "/favicon.ico"] {:body   (io/input-stream (io/resource "favicon.ico"))
+                                         :status 200}
+                  ;; this image is for the header above the page during interactive mode
+                  [:get "/Clay.svg.png"] {:body   (io/input-stream (io/resource "Clay.svg.png"))
+                                          :status 200}
+                  {:body   "not found"
+                   :status 404})))))))))
 
 (defonce *stop-server! (atom nil))
 
