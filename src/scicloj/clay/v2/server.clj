@@ -197,7 +197,6 @@ document.addEventListener('click', (e) => {
   [uri body-params _server-state]
   (let [page (str/replace uri #"^/" "")
         state-id (create-state! body-params)]
-    (println "Initial POST:" page "params:" body-params "→ state-id:" state-id)
     {:status 303
      :headers {"Location" (str "/app/" page "/" state-id)}}))
 
@@ -208,7 +207,6 @@ document.addEventListener('click', (e) => {
   (if-let [current (get-state current-state-id)]
     (let [merged-params (merge (:params current) body-params)
           new-state-id (create-state! merged-params)]
-      (println "State POST:" page "old-state:" current-state-id "→ new-state:" new-state-id)
       {:status 303
        :headers {"Location" (str "/app/" page "/" new-state-id)}})
     ;; Current state expired/not found
@@ -222,7 +220,6 @@ document.addEventListener('click', (e) => {
   (if-let [stored-state (get-state state-id)]
     (let [params (:params stored-state)
           uri (str "/" page)]
-      (println "State GET:" page "state-id:" state-id "params:" params)
       (try
         (let [source-path (html-uri->source-path uri)
               config-fn (resolve 'scicloj.clay.v2.config/config)
@@ -241,8 +238,6 @@ document.addEventListener('click', (e) => {
            :headers {"Content-Type" "text/html"}
            :status 200})
         (catch Exception e
-          (println "Error rendering state:" state-id (.getMessage e))
-          (.printStackTrace e)
           {:body (str "Error generating page: " (.getMessage e))
            :status 500})))
     ;; State not found or expired
