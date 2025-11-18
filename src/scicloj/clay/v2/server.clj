@@ -17,7 +17,7 @@
 (def default-port 1971)
 
 ;; Forward declarations for functions used before definition
-(declare html-uri->source-path wrap-html)
+(declare html-uri->source-path wrap-html cleanup-expired-states!)
 
 (defonce *clients (atom #{}))
 
@@ -29,11 +29,20 @@
 ;; State Management for Parameterized Notebooks
 ;; =============================================================================
 
+;; Configuration for state management
+(def default-state-config
+  {:state-ttl-hours 24           ; How long states persist
+   :cleanup-interval-ms 3600000  ; Background cleanup frequency (1 hour)
+   :max-states 10000})           ; Maximum number of states to store
+
+(defonce *state-config (atom default-state-config))
+
 ;; Stores parameter states for parameterized notebook requests.
 ;; Maps UUID -> {:params {...} :expires <timestamp>}
 (defonce *states (atom {}))
 
-(def default-state-ttl-hours 24)
+;; Background cleanup task executor
+(defonce *cleanup-executor (atom nil))
 
 (defn generate-state-id
   "Generate a cryptographically secure random state ID."
@@ -42,14 +51,27 @@
     (str uuid)))
 
 (defn create-state!
-  "Create a new state with the given params and return the state-id."
-  ([params] (create-state! params default-state-ttl-hours))
+  "Create a new state with the given params and return the state-id.
+   Respects max-states limit by cleaning up expired states first,
+   then removing oldest if still over limit."
+  ([params] (create-state! params (:state-ttl-hours @*state-config)))
   ([params ttl-hours]
-   (let [id (generate-state-id)
-         expires (+ (System/currentTimeMillis)
-                    (* ttl-hours 3600000))]
-     (swap! *states assoc id {:params params :expires expires})
-     id)))
+   (let [max-states (:max-states @*state-config)]
+     ;; Cleanup expired states first if approaching limit
+     (when (>= (count @*states) max-states)
+       (cleanup-expired-states!)
+       ;; If still over limit, remove oldest states
+       (when (>= (count @*states) max-states)
+         (let [sorted-by-expires (->> @*states
+                                      (sort-by (comp :expires val))
+                                      (take (- (count @*states) (dec max-states)))
+                                      (map first))]
+           (swap! *states #(apply dissoc % sorted-by-expires)))))
+     (let [id (generate-state-id)
+           expires (+ (System/currentTimeMillis)
+                      (* ttl-hours 3600000))]
+       (swap! *states assoc id {:params params :expires expires})
+       id))))
 
 (defn get-state
   "Get state by ID. Returns nil if not found or expired."
@@ -65,12 +87,54 @@
 (defn cleanup-expired-states!
   "Remove all expired states from storage."
   []
-  (let [now (System/currentTimeMillis)]
+  (let [now (System/currentTimeMillis)
+        before-count (count @*states)]
     (swap! *states
            (fn [states]
              (->> states
                   (filter (fn [[_ state]] (< now (:expires state))))
-                  (into {}))))))
+                  (into {}))))
+    (let [after-count (count @*states)
+          removed (- before-count after-count)]
+      (when (pos? removed)
+        (println "State cleanup: removed" removed "expired states," after-count "remaining")))))
+
+(defn start-cleanup-task!
+  "Start background task to periodically clean up expired states."
+  []
+  (when-let [existing @*cleanup-executor]
+    (.shutdown existing))
+  (let [interval-ms (:cleanup-interval-ms @*state-config)
+        executor (java.util.concurrent.Executors/newSingleThreadScheduledExecutor)]
+    (.scheduleAtFixedRate executor
+                          (fn []
+                            (try
+                              (cleanup-expired-states!)
+                              (catch Exception e
+                                (println "Error in state cleanup task:" (.getMessage e)))))
+                          interval-ms
+                          interval-ms
+                          java.util.concurrent.TimeUnit/MILLISECONDS)
+    (reset! *cleanup-executor executor)
+    (println "Started state cleanup task (interval:" (/ interval-ms 60000) "minutes)")))
+
+(defn stop-cleanup-task!
+  "Stop the background cleanup task."
+  []
+  (when-let [executor @*cleanup-executor]
+    (.shutdown executor)
+    (reset! *cleanup-executor nil)
+    (println "Stopped state cleanup task")))
+
+(defn configure-state-management!
+  "Update state management configuration.
+   Options:
+   - :state-ttl-hours - How long states persist (default 24)
+   - :cleanup-interval-ms - Cleanup frequency in ms (default 3600000 = 1 hour)
+   - :max-states - Maximum states to store (default 10000)"
+  [opts]
+  (swap! *state-config merge opts)
+  (println "State management configured:" @*state-config))
 
 ;; =============================================================================
 ;; JavaScript for Link-to-POST Conversion
@@ -472,6 +536,8 @@ document.addEventListener('click', (e) => {
        (server.state/set-port! port)
        (reset! *stop-server! stop-server)
        (println "Clay serving at" (port->url port))
+       ;; Start background cleanup task for state management
+       (start-cleanup-task!)
        ;; browse can be :browser to prefer using a browser always
        (when (or (= browse :browser)
                  ;; clay default is browse true,
@@ -507,6 +573,8 @@ document.addEventListener('click', (e) => {
   (broadcast! "loading"))
 
 (defn close! []
+  ;; Stop background cleanup task
+  (stop-cleanup-task!)
   (when-let [s @*stop-server!]
     (s))
   (reset! *stop-server! nil))
